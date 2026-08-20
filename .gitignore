@@ -1,0 +1,3 @@
+# TPU experiment outputs
+results_tpu/*.pth
+results_tpu/**/checkpoint.pth
