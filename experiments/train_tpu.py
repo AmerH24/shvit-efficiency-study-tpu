@@ -324,8 +324,8 @@ def worker(index, args):
 
     device = torch.device("xla")
 
-    world_size = xm.xrt_world_size()
-    rank = xm.get_ordinal()
+    world_size = 1
+    rank = 0
 
     if rank == 0:
         print(
@@ -593,10 +593,7 @@ def worker(index, args):
 def main():
     args = parse_args()
 
-    torch_xla.launch(
-        worker,
-        args=(args,),
-    )
+    worker(0, args)
 
 
 if __name__ == "__main__":
