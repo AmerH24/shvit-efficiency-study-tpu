@@ -1,5 +1,12 @@
 import os
 import sys
+import argparse
+import json
+import time
+
+# ---------------------------------------------------------
+# Make the repository root importable
+# ---------------------------------------------------------
 
 PROJECT_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..")
@@ -8,26 +15,29 @@ PROJECT_ROOT = os.path.abspath(
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import argparse
-import json
-import os
-import time
+
+# ---------------------------------------------------------
+# Imports
+# ---------------------------------------------------------
 
 import torch
 import torch.nn as nn
+
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 
 import torch_xla
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
 
 from timm.models import create_model
 
-# Import registrations for our custom SHViT variants.
+# Register our custom SHViT variants.
 import model  # noqa: F401
 
+
+# ---------------------------------------------------------
+# Available models
+# ---------------------------------------------------------
 
 MODEL_NAMES = [
     "shvit_s1_ratio_1_8",
@@ -36,6 +46,10 @@ MODEL_NAMES = [
     "shvit_s1_progressive",
 ]
 
+
+# ---------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -62,14 +76,13 @@ def parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=30,
+        default=2,
     )
 
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=128,
-        help="Batch size PER TPU process/device.",
+        default=64,
     )
 
     parser.add_argument(
@@ -105,11 +118,21 @@ def parse_args():
     return parser.parse_args()
 
 
+# ---------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------
+
 def build_datasets(args):
+
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(args.input_size),
+        transforms.RandomResizedCrop(
+            args.input_size
+        ),
+
         transforms.RandomHorizontalFlip(),
+
         transforms.ToTensor(),
+
         transforms.Normalize(
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225),
@@ -117,8 +140,12 @@ def build_datasets(args):
     ])
 
     test_transform = transforms.Compose([
-        transforms.Resize(args.input_size),
+        transforms.Resize(
+            args.input_size
+        ),
+
         transforms.ToTensor(),
+
         transforms.Normalize(
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225),
@@ -129,28 +156,37 @@ def build_datasets(args):
         root=args.data_path,
         train=True,
         transform=train_transform,
-        download=True,
+        download=False,
     )
 
     test_dataset = datasets.CIFAR100(
         root=args.data_path,
         train=False,
         transform=test_transform,
-        download=True,
+        download=False,
     )
 
     return train_dataset, test_dataset
 
 
-def accuracy_top1(outputs, targets):
-    predictions = outputs.argmax(dim=1)
+# ---------------------------------------------------------
+# Accuracy
+# ---------------------------------------------------------
 
-    correct = (
+def count_correct(outputs, targets):
+
+    predictions = outputs.argmax(
+        dim=1
+    )
+
+    return (
         predictions == targets
     ).sum()
 
-    return correct
 
+# ---------------------------------------------------------
+# Training
+# ---------------------------------------------------------
 
 def train_one_epoch(
     model_instance,
@@ -159,150 +195,66 @@ def train_one_epoch(
     criterion,
     device,
 ):
+
     model_instance.train()
 
-    total_loss = torch.tensor(
-        0.0,
-        device=device,
-    )
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
 
-    total_correct = torch.tensor(
-        0,
-        device=device,
-        dtype=torch.long,
-    )
+    for images, targets in loader:
 
-    total_samples = torch.tensor(
-        0,
-        device=device,
-        dtype=torch.long,
-    )
+        images = images.to(
+            device
+        )
 
-    device_loader = pl.MpDeviceLoader(
-        loader,
-        device,
-    )
+        targets = targets.to(
+            device
+        )
 
-    for images, targets in device_loader:
         optimizer.zero_grad()
 
-        outputs = model_instance(images)
+        outputs = model_instance(
+            images
+        )
 
         loss = criterion(
             outputs,
-            targets,
+            targets
         )
 
         loss.backward()
 
+        # XLA-aware optimizer update.
         xm.optimizer_step(
             optimizer,
+            barrier=False,
         )
 
         batch_size = targets.size(0)
 
+        # Calling .item() synchronizes the lazy XLA graph.
         total_loss += (
-            loss.detach() * batch_size
+            loss.detach().item()
+            * batch_size
         )
 
-        total_correct += accuracy_top1(
+        correct = count_correct(
             outputs,
-            targets,
+            targets
         )
 
-        total_samples += batch_size
-
-    return (
-        total_loss,
-        total_correct,
-        total_samples,
-    )
-
-
-@torch.no_grad()
-def evaluate(
-    model_instance,
-    loader,
-    criterion,
-    device,
-):
-    model_instance.eval()
-
-    total_loss = torch.tensor(
-        0.0,
-        device=device,
-    )
-
-    total_correct = torch.tensor(
-        0,
-        device=device,
-        dtype=torch.long,
-    )
-
-    total_samples = torch.tensor(
-        0,
-        device=device,
-        dtype=torch.long,
-    )
-
-    device_loader = pl.MpDeviceLoader(
-        loader,
-        device,
-    )
-
-    for images, targets in device_loader:
-        outputs = model_instance(images)
-
-        loss = criterion(
-            outputs,
-            targets,
+        total_correct += (
+            correct.item()
         )
 
-        batch_size = targets.size(0)
-
-        total_loss += (
-            loss * batch_size
+        total_samples += (
+            batch_size
         )
-
-        total_correct += accuracy_top1(
-            outputs,
-            targets,
-        )
-
-        total_samples += batch_size
-
-    return (
-        total_loss,
-        total_correct,
-        total_samples,
-    )
-
-
-def reduce_metrics(
-    loss_sum,
-    correct_sum,
-    sample_sum,
-):
-    total_loss = xm.mesh_reduce(
-        "loss_sum",
-        loss_sum.item(),
-        sum,
-    )
-
-    total_correct = xm.mesh_reduce(
-        "correct_sum",
-        correct_sum.item(),
-        sum,
-    )
-
-    total_samples = xm.mesh_reduce(
-        "sample_sum",
-        sample_sum.item(),
-        sum,
-    )
 
     average_loss = (
-        total_loss / total_samples
+        total_loss
+        / total_samples
     )
 
     accuracy = (
@@ -313,70 +265,149 @@ def reduce_metrics(
 
     return (
         average_loss,
-        accuracy,
+        accuracy
     )
 
 
-def worker(index, args):
+# ---------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------
+
+@torch.no_grad()
+def evaluate(
+    model_instance,
+    loader,
+    criterion,
+    device,
+):
+
+    model_instance.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for images, targets in loader:
+
+        images = images.to(
+            device
+        )
+
+        targets = targets.to(
+            device
+        )
+
+        outputs = model_instance(
+            images
+        )
+
+        loss = criterion(
+            outputs,
+            targets
+        )
+
+        batch_size = targets.size(0)
+
+        total_loss += (
+            loss.item()
+            * batch_size
+        )
+
+        correct = count_correct(
+            outputs,
+            targets
+        )
+
+        total_correct += (
+            correct.item()
+        )
+
+        total_samples += (
+            batch_size
+        )
+
+    average_loss = (
+        total_loss
+        / total_samples
+    )
+
+    accuracy = (
+        100.0
+        * total_correct
+        / total_samples
+    )
+
+    return (
+        average_loss,
+        accuracy
+    )
+
+
+# ---------------------------------------------------------
+# Main training function
+# ---------------------------------------------------------
+
+def main():
+
+    args = parse_args()
+
     torch.manual_seed(
         args.seed
     )
 
-    device = torch.device("xla")
+    # -----------------------------------------------------
+    # IMPORTANT:
+    # Initialize exactly ONE TPU device.
+    #
+    # No launch()
+    # No multiprocessing
+    # No distributed TPU logic
+    # -----------------------------------------------------
 
-    world_size = 1
-    rank = 0
+    device = torch_xla.device()
 
-    if rank == 0:
-        print(
-            f"TPU processes: {world_size}"
-        )
+    print(
+        f"XLA device: {device}"
+    )
 
-        print(
-            f"Model: {args.model}"
-        )
+    print(
+        f"Model: {args.model}"
+    )
 
-        print(
-            f"Input size: {args.input_size}"
-        )
+    print(
+        f"Input size: {args.input_size}"
+    )
 
-        print(
-            f"Epochs: {args.epochs}"
-        )
+    print(
+        f"Epochs: {args.epochs}"
+    )
 
-        print(
-            f"Per-device batch size: "
-            f"{args.batch_size}"
-        )
+    print(
+        f"Batch size: {args.batch_size}"
+    )
 
-        print(
-            f"Global batch size: "
-            f"{args.batch_size * world_size}"
-        )
+    # -----------------------------------------------------
+    # Data
+    # -----------------------------------------------------
 
     train_dataset, test_dataset = (
         build_datasets(args)
     )
 
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        seed=args.seed,
+    print(
+        f"Training samples: "
+        f"{len(train_dataset)}"
     )
 
-    test_sampler = DistributedSampler(
-        test_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=False,
+    print(
+        f"Test samples: "
+        f"{len(test_dataset)}"
     )
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=args.num_workers,
         drop_last=True,
     )
@@ -384,9 +415,17 @@ def worker(index, args):
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
-        sampler=test_sampler,
+        shuffle=False,
         num_workers=args.num_workers,
         drop_last=False,
+    )
+
+    # -----------------------------------------------------
+    # Model
+    # -----------------------------------------------------
+
+    print(
+        "Creating model..."
     )
 
     model_instance = create_model(
@@ -394,19 +433,54 @@ def worker(index, args):
         num_classes=100,
         pretrained=False,
         distillation=False,
-    ).to(device)
-
-    criterion = nn.CrossEntropyLoss()
-
-    global_batch_size = (
-        args.batch_size
-        * world_size
     )
 
+    print(
+        "Moving model to TPU..."
+    )
+
+    model_instance = (
+        model_instance.to(device)
+    )
+
+    number_of_parameters = sum(
+        parameter.numel()
+        for parameter
+        in model_instance.parameters()
+    )
+
+    print(
+        f"Parameters: "
+        f"{number_of_parameters:,}"
+    )
+
+    # -----------------------------------------------------
+    # Loss
+    # -----------------------------------------------------
+
+    criterion = (
+        nn.CrossEntropyLoss()
+    )
+
+    # -----------------------------------------------------
+    # Optimizer
+    # -----------------------------------------------------
+
+    # Match the original SHViT learning-rate
+    # scaling convention:
+    #
+    # effective_lr =
+    # base_lr * batch_size / 512
+    #
     scaled_lr = (
         args.lr
-        * global_batch_size
+        * args.batch_size
         / 512.0
+    )
+
+    print(
+        f"Learning rate: "
+        f"{scaled_lr:.8f}"
     )
 
     optimizer = torch.optim.AdamW(
@@ -416,167 +490,117 @@ def worker(index, args):
     )
 
     scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(
+        torch.optim.lr_scheduler
+        .CosineAnnealingLR(
             optimizer,
             T_max=args.epochs,
         )
     )
 
-    if rank == 0:
-        os.makedirs(
-            args.output_dir,
-            exist_ok=True,
-        )
+    # -----------------------------------------------------
+    # Output
+    # -----------------------------------------------------
 
-    xm.rendezvous(
-        "output_dir_created"
+    os.makedirs(
+        args.output_dir,
+        exist_ok=True
+    )
+
+    log_path = os.path.join(
+        args.output_dir,
+        "log.txt"
     )
 
     best_accuracy = 0.0
 
-    start_time = time.time()
-
-    for epoch in range(args.epochs):
-        train_sampler.set_epoch(epoch)
-
-        epoch_start = time.time()
-
-        (
-            train_loss_sum,
-            train_correct_sum,
-            train_sample_sum,
-        ) = train_one_epoch(
-            model_instance,
-            train_loader,
-            optimizer,
-            criterion,
-            device,
-        )
-
-        (
-            train_loss,
-            train_accuracy,
-        ) = reduce_metrics(
-            train_loss_sum,
-            train_correct_sum,
-            train_sample_sum,
-        )
-
-        (
-            test_loss_sum,
-            test_correct_sum,
-            test_sample_sum,
-        ) = evaluate(
-            model_instance,
-            test_loader,
-            criterion,
-            device,
-        )
-
-        (
-            test_loss,
-            test_accuracy,
-        ) = reduce_metrics(
-            test_loss_sum,
-            test_correct_sum,
-            test_sample_sum,
-        )
-
-        scheduler.step()
-
-        epoch_time = (
-            time.time() - epoch_start
-        )
-
-        if rank == 0:
-            best_accuracy = max(
-                best_accuracy,
-                test_accuracy,
-            )
-
-            row = {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "train_acc1": train_accuracy,
-                "test_loss": test_loss,
-                "test_acc1": test_accuracy,
-                "lr": optimizer.param_groups[0]["lr"],
-                "epoch_time_seconds": epoch_time,
-                "best_acc1": best_accuracy,
-            }
-
-            print(
-                f"\nEpoch {epoch + 1}/"
-                f"{args.epochs}"
-            )
-
-            print(
-                f"Train loss: "
-                f"{train_loss:.4f}"
-            )
-
-            print(
-                f"Train Acc@1: "
-                f"{train_accuracy:.2f}%"
-            )
-
-            print(
-                f"Test loss: "
-                f"{test_loss:.4f}"
-            )
-
-            print(
-                f"Test Acc@1: "
-                f"{test_accuracy:.2f}%"
-            )
-
-            print(
-                f"Epoch time: "
-                f"{epoch_time:.2f}s"
-            )
-
-            log_path = os.path.join(
-                args.output_dir,
-                "log.txt",
-            )
-
-            with open(
-                log_path,
-                "a",
-            ) as log_file:
-                log_file.write(
-                    json.dumps(row)
-                    + "\n"
-                )
-
-            checkpoint_path = os.path.join(
-                args.output_dir,
-                "checkpoint.pth",
-            )
-
-            xm.save(
-                {
-                    "model": (
-                        model_instance.state_dict()
-                    ),
-                    "optimizer": (
-                        optimizer.state_dict()
-                    ),
-                    "epoch": epoch,
-                    "best_acc1": (
-                        best_accuracy
-                    ),
-                },
-                checkpoint_path,
-            )
-
-    total_time = (
-        time.time() - start_time
+    total_start = (
+        time.time()
     )
 
-    if rank == 0:
+    # -----------------------------------------------------
+    # Epoch loop
+    # -----------------------------------------------------
+
+    for epoch in range(
+        args.epochs
+    ):
+
+        epoch_start = (
+            time.time()
+        )
+
         print(
-            f"\nTraining complete."
+            "\n"
+            "================================="
+        )
+
+        print(
+            f"Epoch "
+            f"{epoch + 1}/"
+            f"{args.epochs}"
+        )
+
+        print(
+            "================================="
+        )
+
+        train_loss, train_accuracy = (
+            train_one_epoch(
+                model_instance,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+            )
+        )
+
+        test_loss, test_accuracy = (
+            evaluate(
+                model_instance,
+                test_loader,
+                criterion,
+                device,
+            )
+        )
+
+        # Execute any remaining lazy XLA work.
+        torch_xla.sync(
+            wait=True
+        )
+
+        epoch_time = (
+            time.time()
+            - epoch_start
+        )
+
+        best_accuracy = max(
+            best_accuracy,
+            test_accuracy
+        )
+
+        current_lr = (
+            optimizer
+            .param_groups[0]["lr"]
+        )
+
+        print(
+            f"Train loss: "
+            f"{train_loss:.4f}"
+        )
+
+        print(
+            f"Train Acc@1: "
+            f"{train_accuracy:.2f}%"
+        )
+
+        print(
+            f"Test loss: "
+            f"{test_loss:.4f}"
+        )
+
+        print(
+            f"Test Acc@1: "
+            f"{test_accuracy:.2f}%"
         )
 
         print(
@@ -585,15 +609,106 @@ def worker(index, args):
         )
 
         print(
-            f"Total time: "
-            f"{total_time / 60:.2f} min"
+            f"Epoch time: "
+            f"{epoch_time:.2f}s"
         )
 
+        # -------------------------------------------------
+        # Log
+        # -------------------------------------------------
 
-def main():
-    args = parse_args()
+        row = {
+            "epoch": epoch,
+            "train_loss": (
+                train_loss
+            ),
+            "train_acc1": (
+                train_accuracy
+            ),
+            "test_loss": (
+                test_loss
+            ),
+            "test_acc1": (
+                test_accuracy
+            ),
+            "best_acc1": (
+                best_accuracy
+            ),
+            "lr": current_lr,
+            "epoch_time_seconds": (
+                epoch_time
+            ),
+            "parameters": (
+                number_of_parameters
+            ),
+        }
 
-    worker(0, args)
+        with open(
+            log_path,
+            "a"
+        ) as log_file:
+
+            log_file.write(
+                json.dumps(row)
+                + "\n"
+            )
+
+        # -------------------------------------------------
+        # Checkpoint
+        # -------------------------------------------------
+
+        checkpoint_path = (
+            os.path.join(
+                args.output_dir,
+                "checkpoint.pth"
+            )
+        )
+
+        xm.save(
+            {
+                "model": (
+                    model_instance
+                    .state_dict()
+                ),
+
+                "optimizer": (
+                    optimizer
+                    .state_dict()
+                ),
+
+                "epoch": epoch,
+
+                "best_acc1": (
+                    best_accuracy
+                ),
+            },
+            checkpoint_path,
+        )
+
+        scheduler.step()
+
+    # -----------------------------------------------------
+    # Finished
+    # -----------------------------------------------------
+
+    total_time = (
+        time.time()
+        - total_start
+    )
+
+    print(
+        "\nTraining complete."
+    )
+
+    print(
+        f"Best Acc@1: "
+        f"{best_accuracy:.2f}%"
+    )
+
+    print(
+        f"Total training time: "
+        f"{total_time / 60:.2f} minutes"
+    )
 
 
 if __name__ == "__main__":
