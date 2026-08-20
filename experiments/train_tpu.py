@@ -212,6 +212,10 @@ def train_one_epoch(
             device
         )
 
+        if total_samples == 0:
+            print("Images device:", images.device)
+            print("Targets device:", targets.device)
+
         optimizer.zero_grad()
 
         outputs = model_instance(
@@ -442,6 +446,9 @@ def main():
     model_instance = (
         model_instance.to(device)
     )
+
+    print("Requested device:", device)
+    print("Model parameter device:", next(model_instance.parameters()).device)
 
     number_of_parameters = sum(
         parameter.numel()
